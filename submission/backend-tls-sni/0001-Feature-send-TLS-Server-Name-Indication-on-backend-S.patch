@@ -1,0 +1,174 @@
+From 752b3f3d0a1cb853d04b3d151723cc36543fac68 Mon Sep 17 00:00:00 2001
+From: Aaron Picht <aaron@vynyl.com>
+Date: Tue, 12 May 2026 18:39:29 -0700
+Subject: [PATCH] Feature: send TLS Server Name Indication on backend SSL
+ connection.
+
+When pgpool-II opens an SSL connection to a backend PostgreSQL server,
+the TLS ClientHello did not include the server_name (SNI) extension.
+This prevented using endpoint-routed providers as backends, since they
+read the endpoint identifier from SNI to dispatch the connection to the
+correct compute instance.  Affected services include Neon, AWS RDS
+Proxy, pgEdge and Supabase's pooler.  Without SNI, Neon for example
+rejects the connection with:
+
+    Endpoint ID is not specified. Either please upgrade the postgres
+    client library (libpq) for SNI support or pass the endpoint ID
+    (first part of the domain name) as a parameter.
+
+libpq has set SNI by default since PostgreSQL 14 (commit 5c55dc1, 2021);
+the backend-facing path in Pgpool-II had not been updated to match.
+
+This patch calls SSL_set_tlsext_host_name() with the configured
+backend_hostname immediately before SSL_connect() in
+pool_ssl_negotiate_clientserver().  Per RFC 6066 section 3, SNI must
+carry a DNS name, so we skip it when the host is an IPv4/IPv6 literal
+(detected with inet_pton()), a Unix-domain socket path, or empty.
+A failure to set SNI is logged as a WARNING rather than treated as
+fatal: certificate verification still applies, and providers that do
+not consult SNI are unaffected.
+
+The signature of pool_ssl_negotiate_clientserver() gains a const char
+*hostname parameter.  Both call sites are updated:
+
+* src/protocol/pool_pg_utils.c (make_persistent_db_connection) passes
+  the hostname it already has in scope.  This also covers the health
+  check worker and the streaming-replication delay worker, which both
+  reach SSL through make_persistent_db_connection_noerror().
+
+* src/protocol/child.c (connect_backend) passes
+  BACKEND_INFO(i).backend_hostname for the per-node connection.
+
+The non-USE_SSL stub keeps the new parameter for ABI consistency.
+---
+ src/include/utils/pool_ssl.h |  2 +-
+ src/protocol/child.c         |  3 +-
+ src/protocol/pool_pg_utils.c |  2 +-
+ src/utils/pool_ssl.c         | 53 ++++++++++++++++++++++++++++++++++--
+ 4 files changed, 54 insertions(+), 6 deletions(-)
+
+diff --git a/src/include/utils/pool_ssl.h b/src/include/utils/pool_ssl.h
+index 6171c0a70..250352aeb 100644
+--- a/src/include/utils/pool_ssl.h
++++ b/src/include/utils/pool_ssl.h
+@@ -73,7 +73,7 @@ fDKQXkYuNs474553LBgOhgObJ4Oi7Aeij7XFXfBvTFLJ3ivL9pVYFxg5lUl86pVq\n\
+ 
+ 
+ extern void pool_ssl_negotiate_serverclient(POOL_CONNECTION *cp);
+-extern void pool_ssl_negotiate_clientserver(POOL_CONNECTION *cp);
++extern void pool_ssl_negotiate_clientserver(POOL_CONNECTION *cp, const char *hostname);
+ extern void pool_ssl_close(POOL_CONNECTION *cp);
+ extern int	pool_ssl_read(POOL_CONNECTION *cp, void *buf, int size);
+ extern int	pool_ssl_write(POOL_CONNECTION *cp, const void *buf, int size);
+diff --git a/src/protocol/child.c b/src/protocol/child.c
+index 761876f53..f1d1acf8e 100644
+--- a/src/protocol/child.c
++++ b/src/protocol/child.c
+@@ -1071,7 +1071,8 @@ connect_backend(StartupPacket *sp, POOL_CONNECTION *frontend)
+ 				/* mark this is a backend connection */
+ 				CONNECTION(backend, i)->isbackend = 1;
+ 
+-				pool_ssl_negotiate_clientserver(CONNECTION(backend, i));
++				pool_ssl_negotiate_clientserver(CONNECTION(backend, i),
++												BACKEND_INFO(i).backend_hostname);
+ 
+ 				/*
+ 				 * save startup packet info
+diff --git a/src/protocol/pool_pg_utils.c b/src/protocol/pool_pg_utils.c
+index 2eebbbb3c..e7264dde8 100644
+--- a/src/protocol/pool_pg_utils.c
++++ b/src/protocol/pool_pg_utils.c
+@@ -101,7 +101,7 @@ make_persistent_db_connection(
+ 	cp->con->isbackend = 1;
+ 	pool_set_db_node_id(cp->con, db_node_id);
+ 
+-	pool_ssl_negotiate_clientserver(cp->con);
++	pool_ssl_negotiate_clientserver(cp->con, hostname);
+ 
+ 	/*
+ 	 * build V3 startup packet
+diff --git a/src/utils/pool_ssl.c b/src/utils/pool_ssl.c
+index 7a5af7ca4..8eb6330d9 100644
+--- a/src/utils/pool_ssl.c
++++ b/src/utils/pool_ssl.c
+@@ -92,11 +92,39 @@ static int	init_ssl_ctx(POOL_CONNECTION *cp, enum ssl_conn_type conntype);
+ /* OpenSSL error message */
+ static void perror_ssl(const char *context);
+ 
++/*
++ * Return true if the given host string is a literal IPv4 or IPv6 address.
++ *
++ * SNI (RFC 6066 section 3) prohibits the server_name extension from
++ * carrying anything other than a DNS name, so we must skip it for IP
++ * literals.
++ */
++static bool
++host_is_ip_literal(const char *host)
++{
++	struct in_addr addr4;
++	struct in6_addr addr6;
++
++	if (host == NULL)
++		return false;
++	if (inet_pton(AF_INET, host, &addr4) == 1)
++		return true;
++	if (inet_pton(AF_INET6, host, &addr6) == 1)
++		return true;
++	return false;
++}
++
+ /* Attempt to negotiate a secure connection
+- * between pgpool-II and PostgreSQL backends
++ * between pgpool-II and PostgreSQL backends.
++ *
++ * "hostname" is the configured backend host name; if it is a DNS name
++ * (not an IP literal, not a Unix socket path, not empty), it is sent as
++ * the TLS Server Name Indication (SNI) extension before SSL_connect().
++ * Endpoint-routed providers such as Neon and AWS RDS Proxy use SNI to
++ * dispatch the connection to the correct compute instance.
+  */
+ void
+-pool_ssl_negotiate_clientserver(POOL_CONNECTION *cp)
++pool_ssl_negotiate_clientserver(POOL_CONNECTION *cp, const char *hostname)
+ {
+ 	int			ssl_packet[2] = {htonl(sizeof(int) * 2), htonl(NEGOTIATE_SSL_CODE)};
+ 	char		server_response;
+@@ -140,6 +168,24 @@ pool_ssl_negotiate_clientserver(POOL_CONNECTION *cp)
+ 			}
+ 
+ 			SSL_set_fd(cp->ssl, cp->fd);
++
++			/*
++			 * Set TLS Server Name Indication (SNI) before SSL_connect()
++			 * when the backend host name is a DNS name.  We skip IP
++			 * literals (RFC 6066) and Unix socket paths.  Failure to set
++			 * SNI is not fatal: the handshake will continue, certificate
++			 * verification still applies, and providers that do not
++			 * require SNI will be unaffected.
++			 */
++			if (hostname != NULL && hostname[0] != '\0' &&
++				hostname[0] != '/' && !host_is_ip_literal(hostname))
++			{
++				if (SSL_set_tlsext_host_name(cp->ssl, hostname) != 1)
++					ereport(WARNING,
++							(errmsg("could not set TLS server name indication to \"%s\": %s",
++									hostname, SSLerrmessage(ERR_get_error()))));
++			}
++
+ 			SSL_RETURN_VOID_IF((SSL_connect(cp->ssl) < 0),
+ 							   "SSL_connect");
+ 			cp->ssl_active = 1;
+@@ -1128,8 +1174,9 @@ pool_ssl_negotiate_serverclient(POOL_CONNECTION *cp)
+ }
+ 
+ void
+-pool_ssl_negotiate_clientserver(POOL_CONNECTION *cp)
++pool_ssl_negotiate_clientserver(POOL_CONNECTION *cp, const char *hostname)
+ {
++	(void) hostname;			/* unused without USE_SSL */
+ 
+ 	ereport(DEBUG1,
+ 			(errmsg("SSL is requested but SSL support is not available")));
+-- 
+2.51.2
+

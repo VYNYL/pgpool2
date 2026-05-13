@@ -1,0 +1,108 @@
+From: Aaron Picht <aaron@vynyl.com>
+To: pgpool-hackers@lists.postgresql.org
+Subject: [PATCH] Feature: send TLS Server Name Indication on backend SSL connection.
+
+Hi hackers,
+
+The attached patch teaches pool_ssl_negotiate_clientserver() to set the
+TLS Server Name Indication (SNI) extension before SSL_connect() when
+opening an SSL connection to a backend PostgreSQL server.
+
+Motivation
+----------
+
+Several modern PostgreSQL providers route incoming connections to the
+correct compute endpoint by reading an endpoint identifier from the
+ClientHello's SNI extension.  This is true of Neon, AWS RDS Proxy,
+pgEdge, and Supabase's pooler.  Today, the TLS ClientHello sent by
+Pgpool-II to a backend has no server_name extension at all, so these
+providers cannot dispatch the connection.  Neon returns:
+
+    Endpoint ID is not specified. Either please upgrade the postgres
+    client library (libpq) for SNI support or pass the endpoint ID
+    (first part of the domain name) as a parameter:
+    '?options=endpoint%3D<endpoint-id>'
+
+libpq has set SNI by default since PostgreSQL 14 (the relevant change
+is commit 5c55dc1, "Set SNI by default on libpq connections", 2021;
+see [1]).  This patch brings the backend-facing SSL path in Pgpool-II
+into line with that behaviour.
+
+What the patch does
+-------------------
+
+In pool_ssl_negotiate_clientserver(), immediately before SSL_connect(),
+we call SSL_set_tlsext_host_name() with the configured backend host
+name, subject to the constraints that SNI requires:
+
+  - RFC 6066 section 3 restricts the server_name extension to DNS
+    names, so we skip it when the host is an IPv4 or IPv6 literal
+    (detected with inet_pton()).
+  - We also skip empty values and Unix-domain socket paths.
+  - Failure to set SNI is logged as a WARNING rather than treated as
+    fatal: certificate verification still applies, and providers that
+    do not consult SNI are unaffected.
+
+The function picks up a new "const char *hostname" parameter.  Both
+call sites are updated:
+
+  - src/protocol/pool_pg_utils.c (make_persistent_db_connection) passes
+    the hostname argument it already has in scope.  This also covers
+    the health-check worker (src/main/health_check.c) and the
+    streaming-replication delay worker
+    (src/streaming_replication/pool_worker_child.c), both of which
+    reach SSL via make_persistent_db_connection_noerror().
+  - src/protocol/child.c (connect_backend) passes
+    BACKEND_INFO(i).backend_hostname.
+
+The non-USE_SSL stub takes the new parameter for ABI consistency.
+
+Diffstat
+--------
+
+ src/include/utils/pool_ssl.h |  2 +-
+ src/protocol/child.c         |  3 ++-
+ src/protocol/pool_pg_utils.c |  2 +-
+ src/utils/pool_ssl.c         | 53 +++++++++++++++++++++++++++++++++++++++++---
+ 4 files changed, 54 insertions(+), 6 deletions(-)
+
+Testing
+-------
+
+I verified that the patch applies cleanly against current master
+(fefe0201) and that pgpool builds with -Wall -Wmissing-prototypes
+-Wmissing-declarations clean under gcc 12 / OpenSSL 3 on Debian
+bookworm (aarch64).  I have not yet run the src/test/regression suite
+on a clean tree against this change; I would appreciate a reviewer
+running it once before commit.
+
+The change is target-shaped manually:
+
+  openssl s_client -connect ep-<id>.<region>.aws.neon.tech:5432 \
+      -starttls postgres -servername ep-<id>.<region>.aws.neon.tech
+
+returns "Verify return code: 0 (ok)" against Neon, while omitting
+-servername reproduces the "Endpoint ID is not specified" rejection.
+After the patch, a psql session through Pgpool-II to a Neon backend
+behaves the same way as the s_client probe with -servername set.
+
+Release notes
+-------------
+
+I have deliberately not modified doc/src/sgml/release-4.7.sgml.  Going
+by the recent commit history, release-note entries are added in batch
+by the maintainer (e.g. 686c4467b "Add release note.") rather than
+included in feature patches.  Happy to send a follow-up SGML patch if
+that is preferred.
+
+References
+----------
+
+  [1] https://www.postgresql.org/docs/current/libpq-ssl.html#LIBPQ-SSL-CERTIFICATES
+  [2] PostgreSQL libpq commit 5c55dc1, "Set SNI by default on libpq
+      connections" (2021).
+  [3] RFC 6066 section 3, "Server Name Indication".
+
+Thanks for reviewing!
+
+-- Aaron Picht <aaron@vynyl.com>
