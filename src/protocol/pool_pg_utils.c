@@ -101,7 +101,7 @@ make_persistent_db_connection(
 	cp->con->isbackend = 1;
 	pool_set_db_node_id(cp->con, db_node_id);
 
-	pool_ssl_negotiate_clientserver(cp->con);
+	pool_ssl_negotiate_clientserver(cp->con, hostname);
 
 	/*
 	 * build V3 startup packet

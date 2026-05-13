@@ -92,11 +92,39 @@ static int	init_ssl_ctx(POOL_CONNECTION *cp, enum ssl_conn_type conntype);
 /* OpenSSL error message */
 static void perror_ssl(const char *context);
 
+/*
+ * Return true if the given host string is a literal IPv4 or IPv6 address.
+ *
+ * SNI (RFC 6066 section 3) prohibits the server_name extension from
+ * carrying anything other than a DNS name, so we must skip it for IP
+ * literals.
+ */
+static bool
+host_is_ip_literal(const char *host)
+{
+	struct in_addr addr4;
+	struct in6_addr addr6;
+
+	if (host == NULL)
+		return false;
+	if (inet_pton(AF_INET, host, &addr4) == 1)
+		return true;
+	if (inet_pton(AF_INET6, host, &addr6) == 1)
+		return true;
+	return false;
+}
+
 /* Attempt to negotiate a secure connection
- * between pgpool-II and PostgreSQL backends
+ * between pgpool-II and PostgreSQL backends.
+ *
+ * "hostname" is the configured backend host name; if it is a DNS name
+ * (not an IP literal, not a Unix socket path, not empty), it is sent as
+ * the TLS Server Name Indication (SNI) extension before SSL_connect().
+ * Endpoint-routed providers such as Neon and AWS RDS Proxy use SNI to
+ * dispatch the connection to the correct compute instance.
  */
 void
-pool_ssl_negotiate_clientserver(POOL_CONNECTION *cp)
+pool_ssl_negotiate_clientserver(POOL_CONNECTION *cp, const char *hostname)
 {
 	int			ssl_packet[2] = {htonl(sizeof(int) * 2), htonl(NEGOTIATE_SSL_CODE)};
 	char		server_response;
@@ -140,6 +168,24 @@ pool_ssl_negotiate_clientserver(POOL_CONNECTION *cp)
 			}
 
 			SSL_set_fd(cp->ssl, cp->fd);
+
+			/*
+			 * Set TLS Server Name Indication (SNI) before SSL_connect()
+			 * when the backend host name is a DNS name.  We skip IP
+			 * literals (RFC 6066) and Unix socket paths.  Failure to set
+			 * SNI is not fatal: the handshake will continue, certificate
+			 * verification still applies, and providers that do not
+			 * require SNI will be unaffected.
+			 */
+			if (hostname != NULL && hostname[0] != '\0' &&
+				hostname[0] != '/' && !host_is_ip_literal(hostname))
+			{
+				if (SSL_set_tlsext_host_name(cp->ssl, hostname) != 1)
+					ereport(WARNING,
+							(errmsg("could not set TLS server name indication to \"%s\": %s",
+									hostname, SSLerrmessage(ERR_get_error()))));
+			}
+
 			SSL_RETURN_VOID_IF((SSL_connect(cp->ssl) < 0),
 							   "SSL_connect");
 			cp->ssl_active = 1;
@@ -1128,8 +1174,9 @@ pool_ssl_negotiate_serverclient(POOL_CONNECTION *cp)
 }
 
 void
-pool_ssl_negotiate_clientserver(POOL_CONNECTION *cp)
+pool_ssl_negotiate_clientserver(POOL_CONNECTION *cp, const char *hostname)
 {
+	(void) hostname;			/* unused without USE_SSL */
 
 	ereport(DEBUG1,
 			(errmsg("SSL is requested but SSL support is not available")));
