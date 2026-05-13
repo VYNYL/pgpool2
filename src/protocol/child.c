@@ -1071,7 +1071,8 @@ connect_backend(StartupPacket *sp, POOL_CONNECTION *frontend)
 				/* mark this is a backend connection */
 				CONNECTION(backend, i)->isbackend = 1;
 
-				pool_ssl_negotiate_clientserver(CONNECTION(backend, i));
+				pool_ssl_negotiate_clientserver(CONNECTION(backend, i),
+												BACKEND_INFO(i).backend_hostname);
 
 				/*
 				 * save startup packet info
