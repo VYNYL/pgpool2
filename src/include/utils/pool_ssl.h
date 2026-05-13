@@ -70,7 +70,7 @@ CD1mpF1Bn5x8vYlLIhkmuquiXsNV6TILOwIBAg==\n\
 
 
 extern void pool_ssl_negotiate_serverclient(POOL_CONNECTION *cp);
-extern void pool_ssl_negotiate_clientserver(POOL_CONNECTION *cp);
+extern void pool_ssl_negotiate_clientserver(POOL_CONNECTION *cp, const char *hostname);
 extern void pool_ssl_close(POOL_CONNECTION *cp);
 extern int	pool_ssl_read(POOL_CONNECTION *cp, void *buf, int size);
 extern int	pool_ssl_write(POOL_CONNECTION *cp, const void *buf, int size);
