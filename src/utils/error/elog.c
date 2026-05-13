@@ -2191,6 +2191,32 @@ log_line_prefix(StringInfo buf, const char *line_prefix, ErrorData *edata)
 						appendStringInfoString(buf, dbname);
 				}
 				break;
+			case 'h':
+				{
+					/*
+					 * Client host (or IP, depending on resolver settings).
+					 * Recorded at connection accept time into shared ProcessInfo.
+					 * Falls back to "[unknown]" for processes that don't own a
+					 * frontend connection (parent, PCP worker, watchdog, logger)
+					 * or before a child has accepted one.
+					 */
+					POOL_PROCESS_CONTEXT *pc = pool_get_process_context();
+					const char *client_host = "[unknown]";
+
+					if (pc != NULL && pc->process_info != NULL)
+					{
+						ProcessInfo *pi = &pc->process_info[pc->proc_id];
+
+						if (pi->client_host[0] != '\0')
+							client_host = pi->client_host;
+					}
+
+					if (padding != 0)
+						appendStringInfo(buf, "%*s", padding, client_host);
+					else
+						appendStringInfoString(buf, client_host);
+				}
+				break;
 			case 'p':
 				if (padding != 0)
 					appendStringInfo(buf, "%*d", padding, myProcPid);
