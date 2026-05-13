@@ -978,6 +978,18 @@
 	</row>
 
 	<row>
+	 <entry>%h</entry>
+	 <entry>
+	  Client host name or IP address. The value is captured when
+	  the frontend connection is accepted (see
+	  <xref linkend="guc-log-hostname">). In log lines emitted by
+	  processes that do not own a frontend connection (the main
+	  process, the PCP worker, the watchdog, and the logger),
+	  <literal>%h</literal> renders as <literal>[unknown]</literal>.
+	 </entry>
+	</row>
+
+	<row>
 	 <entry>%u</entry>
 	 <entry>User name</entry>
 	</row>
