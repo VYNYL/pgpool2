@@ -1,0 +1,140 @@
+From: Aaron Picht <aaron@vynyl.com>
+To: pgpool-hackers@lists.postgresql.org
+Subject: [PATCH] Feature: support %h (client host) in log_line_prefix.
+
+Hi hackers,
+
+The attached patch teaches log_line_prefix() in src/utils/error/elog.c
+to recognise %h and substitute the connecting client's host (or IP,
+depending on log_hostname).  Today the format-string parser handles
+
+  %a %P %u %d %p %l %t %m
+
+and silently drops anything else, including %h, even though both the
+PostgreSQL convention and the surrounding pgpool conventions imply
+that %h is supported.  A log_line_prefix of
+
+  '%t [%p]: db=%d user=%u app=%a client=%h '
+
+therefore emits the literal "client=" with no value, which leaves
+audit logs without client attribution.  For operators who use the
+pgpool log as the system of record for client identity (for example,
+NIST 800-53 AU-3 requires client address as a required record content
+field), that is a real gap.
+
+This is a separate thread from my earlier [PATCH] for backend TLS SNI
+[1]; the two fixes are independent and small, but they came from the
+same downstream consumer.  Happy to refold them into a single thread
+if that is preferred.
+
+Motivation
+----------
+
+The client host is already captured at connection-accept time.  In
+src/protocol/child.c (around line 1905 on current master), after the
+getnameinfo() call we have:
+
+    pi = pool_get_my_process_info();
+    StrNCpy(pi->client_host, remote_host, NI_MAXHOST);
+    StrNCpy(pi->client_port, remote_port, NI_MAXSERV);
+
+so by the time any session-level log line fires for that child,
+pi->client_host already holds the value the operator wants.  The only
+missing piece is the case label in log_line_prefix() that reads it
+back out.
+
+What the patch does
+-------------------
+
+A new case 'h' is added to the switch in log_line_prefix(), placed
+alphabetically next to case 'd':.  It reads the current process's
+ProcessInfo and appends pi->client_host, honouring the padding spec
+the same way the surrounding cases do, with "[unknown]" as the
+fallback.
+
+A small subtlety: log_line_prefix() runs in every pgpool process,
+including the main process, the PCP worker, the watchdog, and the
+logger.  None of those initialise a per-process context, and the
+otherwise-natural pool_get_my_process_info() helper calls
+ereport(FATAL) when the context is missing.  The patch therefore
+goes one level lower and uses pool_get_process_context(), which
+returns NULL safely; the "[unknown]" fallback covers both that case
+and child processes that have not yet accepted a frontend
+connection.
+
+Documentation
+-------------
+
+The log_line_prefix escape-options table in
+doc/src/sgml/connection-pooling.sgml (and the mirrored Japanese
+table in doc.ja/src/sgml/connection-pooling.sgml) gains a row for
+%h.  The row also describes the "[unknown]" fallback behaviour for
+log lines emitted by non-session processes.
+
+I considered also adding a %H escape that would render host:port
+(matching the "connecting host=X port=Y" DETAIL line emitted from
+child.c).  I have deferred that here in favour of matching
+PostgreSQL's %h / %r semantics exactly; happy to follow up if
+maintainers would prefer pgpool to also expose host:port.
+
+Diffstat
+--------
+
+ doc.ja/src/sgml/connection-pooling.sgml | 23 +++++++++++++++++++++++
+ doc/src/sgml/connection-pooling.sgml    | 12 ++++++++++++
+ src/utils/error/elog.c                  | 26 ++++++++++++++++++++++++++
+ 3 files changed, 61 insertions(+)
+
+Testing
+-------
+
+I verified that the patch applies cleanly against current master
+(56c6fd7e at the time of writing), and that src/utils/error/elog.c
+compiles -Wall -Wmissing-prototypes -Wmissing-declarations clean
+under gcc / OpenSSL 3 with the patch in place.
+
+Manual verification: with
+
+  log_line_prefix = '%t pid=%p user=%u db=%d client=%h app=%a '
+  log_per_node_statement = on
+  log_connections = on
+
+a stock pgpool 4.7.1 emits "client= " (empty), and the same
+configuration on a patched build emits "client=127.0.0.1 ", which is
+exactly the value already shown in the existing "connecting host=..."
+DETAIL line.
+
+I have not run the full src/test/regression suite on a clean tree
+against this change.  The change is purely additive to a switch
+statement that previously silently ignored the escape, so it should
+be a no-op for anyone whose configured log_line_prefix does not use
+%h, but I would appreciate a reviewer running the suite once before
+commit.
+
+Release notes
+-------------
+
+Following the same convention as for the SNI patch [1], I have not
+modified doc/src/sgml/release-4.X.sgml.  Going by recent history
+(commits 686c4467b, 292f40866, 4d5c0a45a), release-note entries are
+added in a dedicated commit by the maintainer rather than bundled
+with feature patches.  Happy to send a follow-up SGML patch if that
+is preferred.
+
+References
+----------
+
+  [1] [PATCH] Feature: send TLS Server Name Indication on backend
+      SSL connection.
+      (https://www.pgpool.net/pipermail/pgpool-hackers/ -- I will
+      reply to this with the archive URL once that thread is
+      indexed.)
+  [2] PostgreSQL docs, log_line_prefix escape options
+      (https://www.postgresql.org/docs/current/runtime-config-logging.html
+      #GUC-LOG-LINE-PREFIX); pgpool's own
+      doc/src/sgml/connection-pooling.sgml table currently mirrors
+      that set minus %h.
+
+Thanks for reviewing!
+
+-- Aaron Picht <aaron@vynyl.com>

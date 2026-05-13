@@ -1,0 +1,143 @@
+From 47fd7fba76e5b97bba6a036b2142c298ac33c36a Mon Sep 17 00:00:00 2001
+From: Aaron Picht <aaron@vynyl.com>
+Date: Tue, 12 May 2026 22:10:39 -0700
+Subject: [PATCH] Feature: support %h (client host) in log_line_prefix.
+
+pgpool-II's log_line_prefix processor (log_line_prefix() in
+src/utils/error/elog.c) silently dropped %h, even though PostgreSQL
+and the surrounding pgpool conventions imply it is supported.  A
+prefix such as
+
+  log_line_prefix = '%t [%p]: db=%d user=%u app=%a client=%h '
+
+rendered the literal "client=" with no value substituted, leaving
+audit logs without client attribution.  This matters for operators
+who rely on the audit log as the system of record for client
+identity (for example, NIST 800-53 AU-3 lists client address as a
+required record content field).
+
+The client host is already captured at connection-accept time in
+src/protocol/child.c and stored in shared memory on the per-child
+ProcessInfo entry (ProcessInfo.client_host), so this commit only
+needs to teach log_line_prefix() to read it back.
+
+The lookup uses pool_get_process_context() rather than the
+otherwise-similar pool_get_my_process_info(), because the latter
+calls ereport(FATAL) when the per-process context has not been
+initialized.  log_line_prefix() runs in every pgpool process,
+including the main process, the PCP worker, the watchdog, and the
+logger, none of which initialize a process context.  For those
+processes -- and for child processes that have not yet accepted a
+frontend connection -- the value renders as "[unknown]", mirroring
+the convention already used by the %a, %u, and %d cases.
+
+Documentation: the log_line_prefix escape-options table in
+doc/src/sgml/connection-pooling.sgml and the mirrored Japanese
+table in doc.ja/src/sgml/connection-pooling.sgml gain a row for
+%h that also notes the [unknown] fallback for non-session
+processes.
+
+Submitted-by: Aaron Picht <aaron@vynyl.com>
+---
+ doc.ja/src/sgml/connection-pooling.sgml | 23 ++++++++++++++++++++++
+ doc/src/sgml/connection-pooling.sgml    | 12 ++++++++++++
+ src/utils/error/elog.c                  | 26 +++++++++++++++++++++++++
+ 3 files changed, 61 insertions(+)
+
+diff --git a/doc.ja/src/sgml/connection-pooling.sgml b/doc.ja/src/sgml/connection-pooling.sgml
+index 07af0fcd4..199dc32bb 100644
+--- a/doc.ja/src/sgml/connection-pooling.sgml
++++ b/doc.ja/src/sgml/connection-pooling.sgml
+@@ -1489,6 +1489,29 @@ local0.*    /var/log/pgpool.log
+ 	 <entry>データベース名</entry>
+ 	</row>
+ 
++	<row>
++	 <entry>%h</entry>
++	 <!--
++	 <entry>
++	  Client host name or IP address. The value is captured when
++	  the frontend connection is accepted (see
++	  <xref linkend="guc-log-hostname">). In log lines emitted by
++	  processes that do not own a frontend connection (the main
++	  process, the PCP worker, the watchdog, and the logger),
++	  <literal>%h</literal> renders as <literal>[unknown]</literal>.
++	 </entry>
++	 -->
++	 <entry>
++	  クライアントのホスト名またはIPアドレス。
++	  値はフロントエンド接続を受け付ける時点で記録されます
++	  (<xref linkend="guc-log-hostname">を参照してください)。
++	  フロントエンド接続を持たないプロセス
++	  （メインプロセス、PCPワーカー、watchdog、ロガー）から
++	  出力されるログ行では、<literal>%h</literal>は
++	  <literal>[unknown]</literal>として描画されます。
++	 </entry>
++	</row>
++
+ 	<row>
+ 	 <entry>%u</entry>
+ 	 <!--
+diff --git a/doc/src/sgml/connection-pooling.sgml b/doc/src/sgml/connection-pooling.sgml
+index 982ab1870..e18b0ed4f 100644
+--- a/doc/src/sgml/connection-pooling.sgml
++++ b/doc/src/sgml/connection-pooling.sgml
+@@ -977,6 +977,18 @@
+ 	 <entry>Database name</entry>
+ 	</row>
+ 
++	<row>
++	 <entry>%h</entry>
++	 <entry>
++	  Client host name or IP address. The value is captured when
++	  the frontend connection is accepted (see
++	  <xref linkend="guc-log-hostname">). In log lines emitted by
++	  processes that do not own a frontend connection (the main
++	  process, the PCP worker, the watchdog, and the logger),
++	  <literal>%h</literal> renders as <literal>[unknown]</literal>.
++	 </entry>
++	</row>
++
+ 	<row>
+ 	 <entry>%u</entry>
+ 	 <entry>User name</entry>
+diff --git a/src/utils/error/elog.c b/src/utils/error/elog.c
+index d729d500c..6c8f0d062 100644
+--- a/src/utils/error/elog.c
++++ b/src/utils/error/elog.c
+@@ -2191,6 +2191,32 @@ log_line_prefix(StringInfo buf, const char *line_prefix, ErrorData *edata)
+ 						appendStringInfoString(buf, dbname);
+ 				}
+ 				break;
++			case 'h':
++				{
++					/*
++					 * Client host (or IP, depending on resolver settings).
++					 * Recorded at connection accept time into shared ProcessInfo.
++					 * Falls back to "[unknown]" for processes that don't own a
++					 * frontend connection (parent, PCP worker, watchdog, logger)
++					 * or before a child has accepted one.
++					 */
++					POOL_PROCESS_CONTEXT *pc = pool_get_process_context();
++					const char *client_host = "[unknown]";
++
++					if (pc != NULL && pc->process_info != NULL)
++					{
++						ProcessInfo *pi = &pc->process_info[pc->proc_id];
++
++						if (pi->client_host[0] != '\0')
++							client_host = pi->client_host;
++					}
++
++					if (padding != 0)
++						appendStringInfo(buf, "%*s", padding, client_host);
++					else
++						appendStringInfoString(buf, client_host);
++				}
++				break;
+ 			case 'p':
+ 				if (padding != 0)
+ 					appendStringInfo(buf, "%*d", padding, myProcPid);
+-- 
+2.51.2
+
